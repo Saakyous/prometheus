@@ -29,6 +29,7 @@ import (
 	"unsafe"
 
 	"github.com/pkg/errors"
+
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/encoding"
@@ -1074,10 +1075,10 @@ func NewFileReader(path string) (*Reader, error) {
 	}
 	r, err := newReader(realByteSlice(f.Bytes()), f)
 	if err != nil {
-		var merr tsdb_errors.MultiError
-		merr.Add(err)
-		merr.Add(f.Close())
-		return nil, merr
+		return nil, tsdb_errors.NewMulti(
+			err,
+			f.Close(),
+		).Err()
 	}
 
 	return r, nil
@@ -1418,6 +1419,17 @@ func (r *Reader) SymbolTableSize() uint64 {
 	return uint64(r.symbols.Size())
 }
 
+// SortedLabelValues returns value tuples that exist for the given label name.
+// It is not safe to use the return value beyond the lifetime of the byte slice
+// passed into the Reader.
+func (r *Reader) SortedLabelValues(name string) ([]string, error) {
+	values, err := r.LabelValues(name)
+	if err == nil && r.version == FormatV1 {
+		sort.Strings(values)
+	}
+	return values, err
+}
+
 // LabelValues returns value tuples that exist for the given label name.
 // It is not safe to use the return value beyond the lifetime of the byte slice
 // passed into the Reader.
@@ -1431,7 +1443,6 @@ func (r *Reader) LabelValues(name string) ([]string, error) {
 		for k := range e {
 			values = append(values, k)
 		}
-		sort.Strings(values)
 		return values, nil
 
 	}
@@ -1613,7 +1624,7 @@ func (r *Reader) LabelNames() ([]string, error) {
 	return labelNames, nil
 }
 
-// NewStringListIterator returns a StringIter for the given sorted list of strings.
+// NewStringListIter returns a StringIter for the given sorted list of strings.
 func NewStringListIter(s []string) StringIter {
 	return &stringListIter{l: s}
 }

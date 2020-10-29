@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -34,13 +35,14 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/gogo/protobuf/proto"
 	"github.com/golang/snappy"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/route"
+	"github.com/stretchr/testify/require"
 
-	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/pkg/gate"
 	"github.com/prometheus/prometheus/pkg/labels"
@@ -55,7 +57,6 @@ import (
 	"github.com/prometheus/prometheus/storage/remote"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/util/teststorage"
-	"github.com/prometheus/prometheus/util/testutil"
 )
 
 // testMetaStore satisfies the scrape.MetricMetadataStore interface.
@@ -164,9 +165,7 @@ func (t *testTargetRetriever) ResetMetadataStore() {
 }
 
 func (t *testTargetRetriever) toFactory() func(context.Context) TargetRetriever {
-	return func(context.Context) TargetRetriever {
-		return t
-	}
+	return func(context.Context) TargetRetriever { return t }
 }
 
 type testAlertmanagerRetriever struct{}
@@ -189,6 +188,10 @@ func (t testAlertmanagerRetriever) DroppedAlertmanagers() []*url.URL {
 			Path:   "/api/v1/alerts",
 		},
 	}
+}
+
+func (t testAlertmanagerRetriever) toFactory() func(context.Context) AlertmanagerRetriever {
+	return func(context.Context) AlertmanagerRetriever { return t }
 }
 
 type rulesRetrieverMock struct {
@@ -276,6 +279,10 @@ func (m rulesRetrieverMock) RuleGroups() []*rules.Group {
 	return []*rules.Group{group}
 }
 
+func (m rulesRetrieverMock) toFactory() func(context.Context) RulesRetriever {
+	return func(context.Context) RulesRetriever { return m }
+}
+
 var samplePrometheusCfg = config.Config{
 	GlobalConfig:       config.GlobalConfig{},
 	AlertingConfig:     config.AlertingConfig{},
@@ -296,11 +303,16 @@ func TestEndpoints(t *testing.T) {
 			test_metric1{foo="bar"} 0+100x100
 			test_metric1{foo="boo"} 1+0x100
 			test_metric2{foo="boo"} 1+0x100
+			test_metric3{foo="bar", dup="1"} 1+0x100
+			test_metric3{foo="boo", dup="1"} 1+0x100
+			test_metric4{foo="bar", dup="1"} 1+0x100
+			test_metric4{foo="boo", dup="1"} 1+0x100
+			test_metric4{foo="boo"} 1+0x100
 	`)
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 	defer suite.Close()
 
-	testutil.Ok(t, suite.Run())
+	require.NoError(t, suite.Run())
 
 	now := time.Now()
 
@@ -318,12 +330,12 @@ func TestEndpoints(t *testing.T) {
 			Queryable:             suite.Storage(),
 			QueryEngine:           suite.QueryEngine(),
 			targetRetriever:       testTargetRetriever.toFactory(),
-			alertmanagerRetriever: testAlertmanagerRetriever{},
+			alertmanagerRetriever: testAlertmanagerRetriever{}.toFactory(),
 			flagsMap:              sampleFlagMap,
 			now:                   func() time.Time { return now },
 			config:                func() config.Config { return samplePrometheusCfg },
 			ready:                 func(f http.HandlerFunc) http.HandlerFunc { return f },
-			rulesRetriever:        algr,
+			rulesRetriever:        algr.toFactory(),
 		}
 
 		testEndpoints(t, api, testTargetRetriever, true)
@@ -337,13 +349,13 @@ func TestEndpoints(t *testing.T) {
 		defer server.Close()
 
 		u, err := url.Parse(server.URL)
-		testutil.Ok(t, err)
+		require.NoError(t, err)
 
 		al := promlog.AllowedLevel{}
-		testutil.Ok(t, al.Set("debug"))
+		require.NoError(t, al.Set("debug"))
 
 		af := promlog.AllowedFormat{}
-		testutil.Ok(t, af.Set("logfmt"))
+		require.NoError(t, af.Set("logfmt"))
 
 		promlogConfig := promlog.Config{
 			Level:  &al,
@@ -351,12 +363,10 @@ func TestEndpoints(t *testing.T) {
 		}
 
 		dbDir, err := ioutil.TempDir("", "tsdb-api-ready")
-		testutil.Ok(t, err)
+		require.NoError(t, err)
 		defer os.RemoveAll(dbDir)
 
-		remote := remote.NewStorage(promlog.New(&promlogConfig), prometheus.DefaultRegisterer, func() (int64, error) {
-			return 0, nil
-		}, dbDir, 1*time.Second)
+		remote := remote.NewStorage(promlog.New(&promlogConfig), prometheus.DefaultRegisterer, nil, dbDir, 1*time.Second)
 
 		err = remote.ApplyConfig(&config.Config{
 			RemoteReadConfigs: []*config.RemoteReadConfig{
@@ -367,7 +377,7 @@ func TestEndpoints(t *testing.T) {
 				},
 			},
 		})
-		testutil.Ok(t, err)
+		require.NoError(t, err)
 
 		var algr rulesRetrieverMock
 		algr.testing = t
@@ -382,12 +392,12 @@ func TestEndpoints(t *testing.T) {
 			Queryable:             remote,
 			QueryEngine:           suite.QueryEngine(),
 			targetRetriever:       testTargetRetriever.toFactory(),
-			alertmanagerRetriever: testAlertmanagerRetriever{},
+			alertmanagerRetriever: testAlertmanagerRetriever{}.toFactory(),
 			flagsMap:              sampleFlagMap,
 			now:                   func() time.Time { return now },
 			config:                func() config.Config { return samplePrometheusCfg },
 			ready:                 func(f http.HandlerFunc) http.HandlerFunc { return f },
-			rulesRetriever:        algr,
+			rulesRetriever:        algr.toFactory(),
 		}
 
 		testEndpoints(t, api, testTargetRetriever, false)
@@ -405,9 +415,9 @@ func TestLabelNames(t *testing.T) {
 			test_metric2{foo="boo"} 1+0x100
 			test_metric2{foo="boo", xyz="qwerty"} 1+0x100
 	`)
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 	defer suite.Close()
-	testutil.Ok(t, suite.Run())
+	require.NoError(t, suite.Run())
 
 	api := &API{
 		Queryable: suite.Storage(),
@@ -423,7 +433,7 @@ func TestLabelNames(t *testing.T) {
 	for _, method := range []string{http.MethodGet, http.MethodPost} {
 		ctx := context.Background()
 		req, err := request(method)
-		testutil.Ok(t, err)
+		require.NoError(t, err)
 		res := api.labelNames(req.WithContext(ctx))
 		assertAPIError(t, res.err, "")
 		assertAPIResponse(t, res.data, []string{"__name__", "baz", "foo", "foo1", "foo2", "xyz"})
@@ -511,12 +521,8 @@ func setupRemote(s storage.Storage) *httptest.Server {
 			}
 			defer querier.Close()
 
-			set, _, err := querier.Select(false, hints, matchers...)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			resp.Results[i], err = remote.ToQueryResult(set, 1e6)
+			set := querier.Select(false, hints, matchers...)
+			resp.Results[i], _, err = remote.ToQueryResult(set, 1e6)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
@@ -734,6 +740,18 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 			},
 			response: []labels.Labels{
 				labels.FromStrings("__name__", "test_metric1", "foo", "boo"),
+			},
+		},
+		// Try to overlap the selected series set as much as possible to test the result de-duplication works well.
+		{
+			endpoint: api.series,
+			query: url.Values{
+				"match[]": []string{`test_metric4{foo=~".+o$"}`, `test_metric4{dup=~"^1"}`},
+			},
+			response: []labels.Labels{
+				labels.FromStrings("__name__", "test_metric4", "dup", "1", "foo", "bar"),
+				labels.FromStrings("__name__", "test_metric4", "dup", "1", "foo", "boo"),
+				labels.FromStrings("__name__", "test_metric4", "foo", "boo"),
 			},
 		},
 		{
@@ -1191,7 +1209,7 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 				},
 			},
 			response: map[string][]metadata{
-				"go_threads": []metadata{
+				"go_threads": {
 					{textparse.MetricTypeGauge, "Number of OS threads created", ""},
 					{textparse.MetricTypeGauge, "Number of OS threads that were created.", ""},
 				},
@@ -1277,7 +1295,7 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 				},
 			},
 			response: map[string][]metadata{
-				"go_threads": []metadata{
+				"go_threads": {
 					{textparse.MetricTypeGauge, "Number of OS threads created", ""},
 					{textparse.MetricTypeGauge, "Number of OS threads that were created.", ""},
 				},
@@ -1448,6 +1466,8 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 				response: []string{
 					"test_metric1",
 					"test_metric2",
+					"test_metric3",
+					"test_metric4",
 				},
 			},
 			{
@@ -1468,10 +1488,215 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 				},
 				errType: errorBadData,
 			},
+			// Start and end before LabelValues starts.
+			{
+				endpoint: api.labelValues,
+				params: map[string]string{
+					"name": "foo",
+				},
+				query: url.Values{
+					"start": []string{"-2"},
+					"end":   []string{"-1"},
+				},
+				response: []string{},
+			},
+			// Start and end within LabelValues.
+			{
+				endpoint: api.labelValues,
+				params: map[string]string{
+					"name": "foo",
+				},
+				query: url.Values{
+					"start": []string{"1"},
+					"end":   []string{"100"},
+				},
+				response: []string{
+					"bar",
+					"boo",
+				},
+			},
+			// Start before LabelValues, end within LabelValues.
+			{
+				endpoint: api.labelValues,
+				params: map[string]string{
+					"name": "foo",
+				},
+				query: url.Values{
+					"start": []string{"-1"},
+					"end":   []string{"3"},
+				},
+				response: []string{
+					"bar",
+					"boo",
+				},
+			},
+			// Start before LabelValues starts, end after LabelValues ends.
+			{
+				endpoint: api.labelValues,
+				params: map[string]string{
+					"name": "foo",
+				},
+				query: url.Values{
+					"start": []string{"1969-12-31T00:00:00Z"},
+					"end":   []string{"1970-02-01T00:02:03Z"},
+				},
+				response: []string{
+					"bar",
+					"boo",
+				},
+			},
+			// Start with bad data, end within LabelValues.
+			{
+				endpoint: api.labelValues,
+				params: map[string]string{
+					"name": "foo",
+				},
+				query: url.Values{
+					"start": []string{"boop"},
+					"end":   []string{"1"},
+				},
+				errType: errorBadData,
+			},
+			// Start within LabelValues, end after.
+			{
+				endpoint: api.labelValues,
+				params: map[string]string{
+					"name": "foo",
+				},
+				query: url.Values{
+					"start": []string{"1"},
+					"end":   []string{"100000000"},
+				},
+				response: []string{
+					"bar",
+					"boo",
+				},
+			},
+			// Start and end after LabelValues ends.
+			{
+				endpoint: api.labelValues,
+				params: map[string]string{
+					"name": "foo",
+				},
+				query: url.Values{
+					"start": []string{"148966367200.372"},
+					"end":   []string{"148966367200.972"},
+				},
+				response: []string{},
+			},
+			// Only provide Start within LabelValues, don't provide an end time.
+			{
+				endpoint: api.labelValues,
+				params: map[string]string{
+					"name": "foo",
+				},
+				query: url.Values{
+					"start": []string{"2"},
+				},
+				response: []string{
+					"bar",
+					"boo",
+				},
+			},
+			// Only provide end within LabelValues, don't provide a start time.
+			{
+				endpoint: api.labelValues,
+				params: map[string]string{
+					"name": "foo",
+				},
+				query: url.Values{
+					"end": []string{"100"},
+				},
+				response: []string{
+					"bar",
+					"boo",
+				},
+			},
+
 			// Label names.
 			{
 				endpoint: api.labelNames,
-				response: []string{"__name__", "foo"},
+				response: []string{"__name__", "dup", "foo"},
+			},
+			// Start and end before Label names starts.
+			{
+				endpoint: api.labelNames,
+				query: url.Values{
+					"start": []string{"-2"},
+					"end":   []string{"-1"},
+				},
+				response: []string{},
+			},
+			// Start and end within Label names.
+			{
+				endpoint: api.labelNames,
+				query: url.Values{
+					"start": []string{"1"},
+					"end":   []string{"100"},
+				},
+				response: []string{"__name__", "dup", "foo"},
+			},
+			// Start before Label names, end within Label names.
+			{
+				endpoint: api.labelNames,
+				query: url.Values{
+					"start": []string{"-1"},
+					"end":   []string{"10"},
+				},
+				response: []string{"__name__", "dup", "foo"},
+			},
+
+			// Start before Label names starts, end after Label names ends.
+			{
+				endpoint: api.labelNames,
+				query: url.Values{
+					"start": []string{"-1"},
+					"end":   []string{"100000"},
+				},
+				response: []string{"__name__", "dup", "foo"},
+			},
+			// Start with bad data for Label names, end within Label names.
+			{
+				endpoint: api.labelNames,
+				query: url.Values{
+					"start": []string{"boop"},
+					"end":   []string{"1"},
+				},
+				errType: errorBadData,
+			},
+			// Start within Label names, end after.
+			{
+				endpoint: api.labelNames,
+				query: url.Values{
+					"start": []string{"1"},
+					"end":   []string{"1000000006"},
+				},
+				response: []string{"__name__", "dup", "foo"},
+			},
+			// Start and end after Label names ends.
+			{
+				endpoint: api.labelNames,
+				query: url.Values{
+					"start": []string{"148966367200.372"},
+					"end":   []string{"148966367200.972"},
+				},
+				response: []string{},
+			},
+			// Only provide Start within Label names, don't provide an end time.
+			{
+				endpoint: api.labelNames,
+				query: url.Values{
+					"start": []string{"4"},
+				},
+				response: []string{"__name__", "dup", "foo"},
+			},
+			// Only provide End within Label names, don't provide a start time.
+			{
+				endpoint: api.labelNames,
+				query: url.Values{
+					"end": []string{"20"},
+				},
+				response: []string{"__name__", "dup", "foo"},
 			},
 		}...)
 	}
@@ -1497,38 +1722,46 @@ func testEndpoints(t *testing.T, api *API, tr *testTargetRetriever, testLabelAPI
 	}
 
 	for i, test := range tests {
-		for _, method := range methods(test.endpoint) {
-			// Build a context with the correct request params.
-			ctx := context.Background()
-			for p, v := range test.params {
-				ctx = route.WithParam(ctx, p, v)
-			}
-			t.Logf("run %d\t%s\t%q", i, method, test.query.Encode())
+		t.Run(fmt.Sprintf("run %d %s %q", i, describeAPIFunc(test.endpoint), test.query.Encode()), func(t *testing.T) {
+			for _, method := range methods(test.endpoint) {
+				t.Run(method, func(t *testing.T) {
+					// Build a context with the correct request params.
+					ctx := context.Background()
+					for p, v := range test.params {
+						ctx = route.WithParam(ctx, p, v)
+					}
 
-			req, err := request(method, test.query)
-			if err != nil {
-				t.Fatal(err)
-			}
+					req, err := request(method, test.query)
+					if err != nil {
+						t.Fatal(err)
+					}
 
-			tr.ResetMetadataStore()
-			for _, tm := range test.metadata {
-				tr.SetMetadataStoreForTargets(tm.identifier, &testMetaStore{Metadata: tm.metadata})
-			}
+					tr.ResetMetadataStore()
+					for _, tm := range test.metadata {
+						tr.SetMetadataStoreForTargets(tm.identifier, &testMetaStore{Metadata: tm.metadata})
+					}
 
-			res := test.endpoint(req.WithContext(ctx))
-			assertAPIError(t, res.err, test.errType)
+					res := test.endpoint(req.WithContext(ctx))
+					assertAPIError(t, res.err, test.errType)
 
-			if test.sorter != nil {
-				test.sorter(res.data)
-			}
+					if test.sorter != nil {
+						test.sorter(res.data)
+					}
 
-			if test.responseLen != 0 {
-				assertAPIResponseLength(t, res.data, test.responseLen)
-			} else {
-				assertAPIResponse(t, res.data, test.response)
+					if test.responseLen != 0 {
+						assertAPIResponseLength(t, res.data, test.responseLen)
+					} else {
+						assertAPIResponse(t, res.data, test.response)
+					}
+				})
 			}
-		}
+		})
 	}
+}
+
+func describeAPIFunc(f apiFunc) string {
+	name := runtime.FuncForPC(reflect.ValueOf(f).Pointer()).Name()
+	return strings.Split(name[strings.LastIndex(name, ".")+1:], "-")[0]
 }
 
 func assertAPIError(t *testing.T, got *apiError, exp errorType) {
@@ -1551,23 +1784,7 @@ func assertAPIError(t *testing.T, got *apiError, exp errorType) {
 func assertAPIResponse(t *testing.T, got interface{}, exp interface{}) {
 	t.Helper()
 
-	if !reflect.DeepEqual(exp, got) {
-		respJSON, err := json.Marshal(got)
-		if err != nil {
-			t.Fatalf("failed to marshal response as JSON: %v", err.Error())
-		}
-
-		expectedRespJSON, err := json.Marshal(exp)
-		if err != nil {
-			t.Fatalf("failed to marshal expected response as JSON: %v", err.Error())
-		}
-
-		t.Fatalf(
-			"Response does not match, expected:\n%+v\ngot:\n%+v",
-			string(expectedRespJSON),
-			string(respJSON),
-		)
-	}
+	require.Equal(t, exp, got)
 }
 
 func assertAPIResponseLength(t *testing.T, got interface{}, expLen int) {
@@ -1588,12 +1805,12 @@ func TestSampledReadEndpoint(t *testing.T) {
 		load 1m
 			test_metric1{foo="bar",baz="qux"} 1
 	`)
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	defer suite.Close()
 
 	err = suite.Run()
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	api := &API{
 		Queryable:   suite.Storage(),
@@ -1616,21 +1833,21 @@ func TestSampledReadEndpoint(t *testing.T) {
 
 	// Encode the request.
 	matcher1, err := labels.NewMatcher(labels.MatchEqual, "__name__", "test_metric1")
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	matcher2, err := labels.NewMatcher(labels.MatchEqual, "d", "e")
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	query, err := remote.ToQuery(0, 1, []*labels.Matcher{matcher1, matcher2}, &storage.SelectHints{Step: 0, Func: "avg"})
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	req := &prompb.ReadRequest{Queries: []*prompb.Query{query}}
 	data, err := proto.Marshal(req)
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	compressed := snappy.Encode(nil, data)
 	request, err := http.NewRequest("POST", "", bytes.NewBuffer(compressed))
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	recorder := httptest.NewRecorder()
 	api.remoteRead(recorder, request)
@@ -1639,25 +1856,25 @@ func TestSampledReadEndpoint(t *testing.T) {
 		t.Fatal(recorder.Code)
 	}
 
-	testutil.Equals(t, "application/x-protobuf", recorder.Result().Header.Get("Content-Type"))
-	testutil.Equals(t, "snappy", recorder.Result().Header.Get("Content-Encoding"))
+	require.Equal(t, "application/x-protobuf", recorder.Result().Header.Get("Content-Type"))
+	require.Equal(t, "snappy", recorder.Result().Header.Get("Content-Encoding"))
 
 	// Decode the response.
 	compressed, err = ioutil.ReadAll(recorder.Result().Body)
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	uncompressed, err := snappy.Decode(nil, compressed)
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	var resp prompb.ReadResponse
 	err = proto.Unmarshal(uncompressed, &resp)
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	if len(resp.Results) != 1 {
 		t.Fatalf("Expected 1 result, got %d", len(resp.Results))
 	}
 
-	testutil.Equals(t, &prompb.QueryResult{
+	require.Equal(t, &prompb.QueryResult{
 		Timeseries: []*prompb.TimeSeries{
 			{
 				Labels: []prompb.Label{
@@ -1683,11 +1900,11 @@ func TestStreamReadEndpoint(t *testing.T) {
             test_metric1{foo="bar2",baz="qux"} 0+100x120
             test_metric1{foo="bar3",baz="qux"} 0+100x240
 	`)
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	defer suite.Close()
 
-	testutil.Ok(t, suite.Run())
+	require.NoError(t, suite.Run())
 
 	api := &API{
 		Queryable:   suite.Storage(),
@@ -1712,13 +1929,13 @@ func TestStreamReadEndpoint(t *testing.T) {
 
 	// Encode the request.
 	matcher1, err := labels.NewMatcher(labels.MatchEqual, "__name__", "test_metric1")
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	matcher2, err := labels.NewMatcher(labels.MatchEqual, "d", "e")
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	matcher3, err := labels.NewMatcher(labels.MatchEqual, "foo", "bar1")
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	query1, err := remote.ToQuery(0, 14400001, []*labels.Matcher{matcher1, matcher2}, &storage.SelectHints{
 		Step:  1,
@@ -1726,7 +1943,7 @@ func TestStreamReadEndpoint(t *testing.T) {
 		Start: 0,
 		End:   14400001,
 	})
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	query2, err := remote.ToQuery(0, 14400001, []*labels.Matcher{matcher1, matcher3}, &storage.SelectHints{
 		Step:  1,
@@ -1734,18 +1951,18 @@ func TestStreamReadEndpoint(t *testing.T) {
 		Start: 0,
 		End:   14400001,
 	})
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	req := &prompb.ReadRequest{
 		Queries:               []*prompb.Query{query1, query2},
 		AcceptedResponseTypes: []prompb.ReadRequest_ResponseType{prompb.ReadRequest_STREAMED_XOR_CHUNKS},
 	}
 	data, err := proto.Marshal(req)
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	compressed := snappy.Encode(nil, data)
 	request, err := http.NewRequest("POST", "", bytes.NewBuffer(compressed))
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	recorder := httptest.NewRecorder()
 	api.remoteRead(recorder, request)
@@ -1754,8 +1971,8 @@ func TestStreamReadEndpoint(t *testing.T) {
 		t.Fatal(recorder.Code)
 	}
 
-	testutil.Equals(t, "application/x-streamed-protobuf; proto=prometheus.ChunkedReadResponse", recorder.Result().Header.Get("Content-Type"))
-	testutil.Equals(t, "", recorder.Result().Header.Get("Content-Encoding"))
+	require.Equal(t, "application/x-streamed-protobuf; proto=prometheus.ChunkedReadResponse", recorder.Result().Header.Get("Content-Type"))
+	require.Equal(t, "", recorder.Result().Header.Get("Content-Encoding"))
 
 	var results []*prompb.ChunkedReadResponse
 	stream := remote.NewChunkedReader(recorder.Result().Body, remote.DefaultChunkedReadLimit, nil)
@@ -1765,7 +1982,7 @@ func TestStreamReadEndpoint(t *testing.T) {
 		if err == io.EOF {
 			break
 		}
-		testutil.Ok(t, err)
+		require.NoError(t, err)
 		results = append(results, res)
 	}
 
@@ -1773,7 +1990,7 @@ func TestStreamReadEndpoint(t *testing.T) {
 		t.Fatalf("Expected 5 result, got %d", len(results))
 	}
 
-	testutil.Equals(t, []*prompb.ChunkedReadResponse{
+	require.Equal(t, []*prompb.ChunkedReadResponse{
 		{
 			ChunkedSeries: []*prompb.ChunkedSeries{
 				{
@@ -1909,7 +2126,7 @@ func (f *fakeDB) Stats(statsByLabelName string) (_ *tsdb.Stats, retErr error) {
 			retErr = err
 		}
 	}()
-	h, _ := tsdb.NewHead(nil, nil, nil, 1000, "", nil, tsdb.DefaultStripeSize)
+	h, _ := tsdb.NewHead(nil, nil, nil, 1000, "", nil, tsdb.DefaultStripeSize, nil)
 	return h.Stats(statsByLabelName), nil
 }
 
@@ -2077,7 +2294,7 @@ func TestAdminEndpoints(t *testing.T) {
 		tc := tc
 		t.Run("", func(t *testing.T) {
 			dir, _ := ioutil.TempDir("", "fakeDB")
-			defer testutil.Ok(t, os.RemoveAll(dir))
+			defer func() { require.NoError(t, os.RemoveAll(dir)) }()
 
 			api := &API{
 				db:          tc.db,
@@ -2088,7 +2305,7 @@ func TestAdminEndpoints(t *testing.T) {
 
 			endpoint := tc.endpoint(api)
 			req, err := http.NewRequest(tc.method, fmt.Sprintf("?%s", tc.values.Encode()), nil)
-			testutil.Ok(t, err)
+			require.NoError(t, err)
 
 			res := setUnavailStatusOnTSDBNotReady(endpoint(req))
 			assertAPIError(t, res.err, tc.errType)
@@ -2129,9 +2346,7 @@ func TestRespondSuccess(t *testing.T) {
 		Status: statusSuccess,
 		Data:   "test",
 	}
-	if !reflect.DeepEqual(&res, exp) {
-		t.Fatalf("Expected response \n%v\n but got \n%v\n", res, exp)
-	}
+	require.Equal(t, exp, &res)
 }
 
 func TestRespondError(t *testing.T) {
@@ -2169,9 +2384,7 @@ func TestRespondError(t *testing.T) {
 		ErrorType: errorTimeout,
 		Error:     "message",
 	}
-	if !reflect.DeepEqual(&res, exp) {
-		t.Fatalf("Expected response \n%v\n but got \n%v\n", res, exp)
-	}
+	require.Equal(t, exp, &res)
 }
 
 func TestParseTimeParam(t *testing.T) {
@@ -2181,7 +2394,7 @@ func TestParseTimeParam(t *testing.T) {
 	}
 
 	ts, err := parseTime("1582468023986")
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	var tests = []struct {
 		paramName    string
@@ -2223,15 +2436,15 @@ func TestParseTimeParam(t *testing.T) {
 
 	for _, test := range tests {
 		req, err := http.NewRequest("GET", "localhost:42/foo?"+test.paramName+"="+test.paramValue, nil)
-		testutil.Ok(t, err)
+		require.NoError(t, err)
 
 		result := test.result
 		asTime, err := parseTimeParam(req, test.paramName, test.defaultValue)
 
 		if err != nil {
-			testutil.ErrorEqual(t, result.asError(), err)
+			require.EqualError(t, err, result.asError().Error())
 		} else {
-			testutil.Assert(t, asTime.Equal(result.asTime), "time as return value: %s not parsed correctly. Expected %s. Actual %s", test.paramValue, result.asTime, asTime)
+			require.True(t, asTime.Equal(result.asTime), "time as return value: %s not parsed correctly. Expected %s. Actual %s", test.paramValue, result.asTime, asTime)
 		}
 	}
 }
@@ -2500,7 +2713,7 @@ func TestTSDBStatus(t *testing.T) {
 	} {
 		tc := tc
 		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
-			api := &API{db: tc.db}
+			api := &API{db: tc.db, gatherer: prometheus.DefaultGatherer}
 			endpoint := tc.endpoint(api)
 			req, err := http.NewRequest(tc.method, fmt.Sprintf("?%s", tc.values.Encode()), nil)
 			if err != nil {
@@ -2509,6 +2722,42 @@ func TestTSDBStatus(t *testing.T) {
 			res := endpoint(req)
 			assertAPIError(t, res.err, tc.errType)
 		})
+	}
+}
+
+func TestReturnAPIError(t *testing.T) {
+	cases := []struct {
+		err      error
+		expected errorType
+	}{
+		{
+			err:      promql.ErrStorage{Err: errors.New("storage error")},
+			expected: errorInternal,
+		}, {
+			err:      errors.Wrap(promql.ErrStorage{Err: errors.New("storage error")}, "wrapped"),
+			expected: errorInternal,
+		}, {
+			err:      promql.ErrQueryTimeout("timeout error"),
+			expected: errorTimeout,
+		}, {
+			err:      errors.Wrap(promql.ErrQueryTimeout("timeout error"), "wrapped"),
+			expected: errorTimeout,
+		}, {
+			err:      promql.ErrQueryCanceled("canceled error"),
+			expected: errorCanceled,
+		}, {
+			err:      errors.Wrap(promql.ErrQueryCanceled("canceled error"), "wrapped"),
+			expected: errorCanceled,
+		}, {
+			err:      errors.New("exec error"),
+			expected: errorExec,
+		},
+	}
+
+	for _, c := range cases {
+		actual := returnAPIError(c.err)
+		require.Error(t, actual)
+		require.Equal(t, c.expected, actual.typ)
 	}
 }
 

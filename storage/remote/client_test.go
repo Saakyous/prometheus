@@ -25,8 +25,7 @@ import (
 	"github.com/pkg/errors"
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
-
-	"github.com/prometheus/prometheus/util/testutil"
+	"github.com/stretchr/testify/require"
 )
 
 var longErrMessage = strings.Repeat("error message", maxErrMsgLen)
@@ -50,11 +49,11 @@ func TestStoreHTTPErrorHandling(t *testing.T) {
 		},
 		{
 			code: 500,
-			err:  recoverableError{errors.New("server returned HTTP status 500 Internal Server Error: " + longErrMessage[:maxErrMsgLen])},
+			err:  RecoverableError{errors.New("server returned HTTP status 500 Internal Server Error: " + longErrMessage[:maxErrMsgLen])},
 		},
 	}
 
-	for i, test := range tests {
+	for _, test := range tests {
 		server := httptest.NewServer(
 			http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, longErrMessage, test.code)
@@ -62,7 +61,7 @@ func TestStoreHTTPErrorHandling(t *testing.T) {
 		)
 
 		serverURL, err := url.Parse(server.URL)
-		testutil.Ok(t, err)
+		require.NoError(t, err)
 
 		conf := &ClientConfig{
 			URL:     &config_util.URL{URL: serverURL},
@@ -70,12 +69,16 @@ func TestStoreHTTPErrorHandling(t *testing.T) {
 		}
 
 		hash, err := toHash(conf)
-		testutil.Ok(t, err)
-		c, err := NewClient(hash, conf)
-		testutil.Ok(t, err)
+		require.NoError(t, err)
+		c, err := NewWriteClient(hash, conf)
+		require.NoError(t, err)
 
 		err = c.Store(context.Background(), []byte{})
-		testutil.ErrorEqual(t, err, test.err, "unexpected error in test %d", i)
+		if test.err != nil {
+			require.EqualError(t, err, test.err.Error())
+		} else {
+			require.NoError(t, err)
+		}
 
 		server.Close()
 	}

@@ -8,7 +8,7 @@ import (
 	"text/template"
 
 	"github.com/golang/glog"
-	generator2 "github.com/golang/protobuf/protoc-gen-go/generator"
+	"github.com/grpc-ecosystem/grpc-gateway/internal/casing"
 	"github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway/descriptor"
 	"github.com/grpc-ecosystem/grpc-gateway/utilities"
 )
@@ -38,7 +38,7 @@ func (b binding) GetBodyFieldPath() string {
 // GetBodyFieldPath returns the binding body's struct field name.
 func (b binding) GetBodyFieldStructName() (string, error) {
 	if b.Body != nil && len(b.Body.FieldPath) != 0 {
-		return generator2.CamelCase(b.Body.FieldPath.String()), nil
+		return casing.Camel(b.Body.FieldPath.String()), nil
 	}
 	return "", errors.New("No body field found")
 }
@@ -122,7 +122,7 @@ func (b binding) FieldMaskField() string {
 		}
 	}
 	if fieldMaskField != nil {
-		return generator2.CamelCase(fieldMaskField.GetName())
+		return casing.Camel(fieldMaskField.GetName())
 	}
 	return ""
 }
@@ -156,16 +156,16 @@ func applyTemplate(p param, reg *descriptor.Registry) (string, error) {
 	var targetServices []*descriptor.Service
 
 	for _, msg := range p.Messages {
-		msgName := generator2.CamelCase(*msg.Name)
+		msgName := casing.Camel(*msg.Name)
 		msg.Name = &msgName
 	}
 	for _, svc := range p.Services {
 		var methodWithBindingsSeen bool
-		svcName := generator2.CamelCase(*svc.Name)
+		svcName := casing.Camel(*svc.Name)
 		svc.Name = &svcName
 		for _, meth := range svc.Methods {
 			glog.V(2).Infof("Processing %s.%s", svc.GetName(), meth.GetName())
-			methName := generator2.CamelCase(*meth.Name)
+			methName := casing.Camel(*meth.Name)
 			meth.Name = &methName
 			for _, b := range meth.Bindings {
 				methodWithBindingsSeen = true
@@ -240,6 +240,7 @@ var _ status.Status
 var _ = runtime.String
 var _ = utilities.NewDoubleArray
 var _ = descriptor.ForMessage
+var _ = metadata.Join
 `))
 
 	handlerTemplate = template.Must(template.New("handler").Parse(`
@@ -359,10 +360,10 @@ var (
 {{if $param.IsNestedProto3}}
 	err = runtime.PopulateFieldFromPath(&protoReq, {{$param | printf "%q"}}, val)
 	{{if $enum}}
-		e{{if $param.IsRepeated}}s{{end}}, err = {{$param.ConvertFuncExpr}}(val{{if $param.IsRepeated}}, {{$binding.Registry.GetRepeatedPathParamSeparator | printf "%c" | printf "%q"}}{{end}}, {{$enum.GoType $param.Target.Message.File.GoPkg.Path}}_value)
+		e{{if $param.IsRepeated}}s{{end}}, err = {{$param.ConvertFuncExpr}}(val{{if $param.IsRepeated}}, {{$binding.Registry.GetRepeatedPathParamSeparator | printf "%c" | printf "%q"}}{{end}}, {{$enum.GoType $param.Method.Service.File.GoPkg.Path}}_value)
 	{{end}}
 {{else if $enum}}
-	e{{if $param.IsRepeated}}s{{end}}, err = {{$param.ConvertFuncExpr}}(val{{if $param.IsRepeated}}, {{$binding.Registry.GetRepeatedPathParamSeparator | printf "%c" | printf "%q"}}{{end}}, {{$enum.GoType $param.Target.Message.File.GoPkg.Path}}_value)
+	e{{if $param.IsRepeated}}s{{end}}, err = {{$param.ConvertFuncExpr}}(val{{if $param.IsRepeated}}, {{$binding.Registry.GetRepeatedPathParamSeparator | printf "%c" | printf "%q"}}{{end}}, {{$enum.GoType $param.Method.Service.File.GoPkg.Path}}_value)
 {{else}}
 	{{$param.AssignableExpr "protoReq"}}, err = {{$param.ConvertFuncExpr}}(val{{if $param.IsRepeated}}, {{$binding.Registry.GetRepeatedPathParamSeparator | printf "%c" | printf "%q"}}{{end}})
 {{end}}
@@ -370,13 +371,13 @@ var (
 		return nil, metadata, status.Errorf(codes.InvalidArgument, "type mismatch, parameter: %s, error: %v", {{$param | printf "%q"}}, err)
 	}
 {{if and $enum $param.IsRepeated}}
-	s := make([]{{$enum.GoType $param.Target.Message.File.GoPkg.Path}}, len(es))
+	s := make([]{{$enum.GoType $param.Method.Service.File.GoPkg.Path}}, len(es))
 	for i, v := range es {
-		s[i] = {{$enum.GoType $param.Target.Message.File.GoPkg.Path}}(v)
+		s[i] = {{$enum.GoType $param.Method.Service.File.GoPkg.Path}}(v)
 	}
 	{{$param.AssignableExpr "protoReq"}} = s
 {{else if $enum}}
-	{{$param.AssignableExpr "protoReq"}} = {{$enum.GoType $param.Target.Message.File.GoPkg.Path}}(e)
+	{{$param.AssignableExpr "protoReq"}} = {{$enum.GoType $param.Method.Service.File.GoPkg.Path}}(e)
 {{end}}
 	{{end}}
 {{end}}
@@ -521,10 +522,10 @@ func local_request_{{.Method.Service.GetName}}_{{.Method.GetName}}_{{.Index}}(ct
 {{if $param.IsNestedProto3}}
 	err = runtime.PopulateFieldFromPath(&protoReq, {{$param | printf "%q"}}, val)
 	{{if $enum}}
-		e{{if $param.IsRepeated}}s{{end}}, err = {{$param.ConvertFuncExpr}}(val{{if $param.IsRepeated}}, {{$binding.Registry.GetRepeatedPathParamSeparator | printf "%c" | printf "%q"}}{{end}}, {{$enum.GoType $param.Target.Message.File.GoPkg.Path}}_value)
+		e{{if $param.IsRepeated}}s{{end}}, err = {{$param.ConvertFuncExpr}}(val{{if $param.IsRepeated}}, {{$binding.Registry.GetRepeatedPathParamSeparator | printf "%c" | printf "%q"}}{{end}}, {{$enum.GoType $param.Method.Service.File.GoPkg.Path}}_value)
 	{{end}}
 {{else if $enum}}
-	e{{if $param.IsRepeated}}s{{end}}, err = {{$param.ConvertFuncExpr}}(val{{if $param.IsRepeated}}, {{$binding.Registry.GetRepeatedPathParamSeparator | printf "%c" | printf "%q"}}{{end}}, {{$enum.GoType $param.Target.Message.File.GoPkg.Path}}_value)
+	e{{if $param.IsRepeated}}s{{end}}, err = {{$param.ConvertFuncExpr}}(val{{if $param.IsRepeated}}, {{$binding.Registry.GetRepeatedPathParamSeparator | printf "%c" | printf "%q"}}{{end}}, {{$enum.GoType $param.Method.Service.File.GoPkg.Path}}_value)
 {{else}}
 	{{$param.AssignableExpr "protoReq"}}, err = {{$param.ConvertFuncExpr}}(val{{if $param.IsRepeated}}, {{$binding.Registry.GetRepeatedPathParamSeparator | printf "%c" | printf "%q"}}{{end}})
 {{end}}
@@ -532,18 +533,21 @@ func local_request_{{.Method.Service.GetName}}_{{.Method.GetName}}_{{.Index}}(ct
 		return nil, metadata, status.Errorf(codes.InvalidArgument, "type mismatch, parameter: %s, error: %v", {{$param | printf "%q"}}, err)
 	}
 {{if and $enum $param.IsRepeated}}
-	s := make([]{{$enum.GoType $param.Target.Message.File.GoPkg.Path}}, len(es))
+	s := make([]{{$enum.GoType $param.Method.Service.File.GoPkg.Path}}, len(es))
 	for i, v := range es {
-		s[i] = {{$enum.GoType $param.Target.Message.File.GoPkg.Path}}(v)
+		s[i] = {{$enum.GoType $param.Method.Service.File.GoPkg.Path}}(v)
 	}
 	{{$param.AssignableExpr "protoReq"}} = s
 {{else if $enum}}
-	{{$param.AssignableExpr "protoReq"}} = {{$enum.GoType $param.Target.Message.File.GoPkg.Path}}(e)
+	{{$param.AssignableExpr "protoReq"}} = {{$enum.GoType $param.Method.Service.File.GoPkg.Path}}(e)
 {{end}}
 	{{end}}
 {{end}}
 {{if .HasQueryParam}}
-	if err := runtime.PopulateQueryParameters(&protoReq, req.URL.Query(), filter_{{.Method.Service.GetName}}_{{.Method.GetName}}_{{.Index}}); err != nil {
+	if err := req.ParseForm(); err != nil {
+		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
+	}
+	if err := runtime.PopulateQueryParameters(&protoReq, req.Form, filter_{{.Method.Service.GetName}}_{{.Method.GetName}}_{{.Index}}); err != nil {
 		return nil, metadata, status.Errorf(codes.InvalidArgument, "%v", err)
 	}
 {{end}}
@@ -561,6 +565,7 @@ func local_request_{{.Method.Service.GetName}}_{{.Method.GetName}}_{{.Index}}(ct
 // Register{{$svc.GetName}}{{$.RegisterFuncSuffix}}Server registers the http handlers for service {{$svc.GetName}} to "mux".
 // UnaryRPC     :call {{$svc.GetName}}Server directly.
 // StreamingRPC :currently unsupported pending https://github.com/grpc/grpc-go/issues/906.
+// Note that using this registration option will cause many gRPC library features to stop working. Consider using Register{{$svc.GetName}}{{$.RegisterFuncSuffix}}FromEndpoint instead.
 func Register{{$svc.GetName}}{{$.RegisterFuncSuffix}}Server(ctx context.Context, mux *runtime.ServeMux, server {{$svc.GetName}}Server) error {
 	{{range $m := $svc.Methods}}
 	{{range $b := $m.Bindings}}
@@ -579,6 +584,8 @@ func Register{{$svc.GetName}}{{$.RegisterFuncSuffix}}Server(ctx context.Context,
 		ctx, cancel := context.WithCancel(ctx)
 	{{- end }}
 		defer cancel()
+		var stream runtime.ServerTransportStream
+		ctx = grpc.NewContextWithServerTransportStream(ctx, &stream)
 		inboundMarshaler, outboundMarshaler := runtime.MarshalerForRequest(mux, req)
 		rctx, err := runtime.AnnotateIncomingContext(ctx, mux, req)
 		if err != nil {
@@ -586,6 +593,7 @@ func Register{{$svc.GetName}}{{$.RegisterFuncSuffix}}Server(ctx context.Context,
 			return
 		}
 		resp, md, err := local_request_{{$svc.GetName}}_{{$m.GetName}}_{{$b.Index}}(rctx, inboundMarshaler, server, req, pathParams)
+		md.HeaderMD, md.TrailerMD = metadata.Join(md.HeaderMD, stream.Header()), metadata.Join(md.TrailerMD, stream.Trailer())
 		ctx = runtime.NewServerMetadataContext(ctx, md)
 		if err != nil {
 			runtime.HTTPError(ctx, mux, outboundMarshaler, w, req, err)

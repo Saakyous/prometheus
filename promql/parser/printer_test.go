@@ -16,7 +16,7 @@ package parser
 import (
 	"testing"
 
-	"github.com/prometheus/prometheus/util/testutil"
+	"github.com/stretchr/testify/require"
 )
 
 func TestExprString(t *testing.T) {
@@ -89,17 +89,26 @@ func TestExprString(t *testing.T) {
 		{
 			in: `{__name__="a"}`,
 		},
+		{
+			in: `a{b!="c"}[1m]`,
+		},
+		{
+			in: `a{b=~"c"}[1m]`,
+		},
+		{
+			in: `a{b!~"c"}[1m]`,
+		},
 	}
 
 	for _, test := range inputs {
 		expr, err := ParseExpr(test.in)
-		testutil.Ok(t, err)
+		require.NoError(t, err)
 
 		exp := test.in
 		if test.out != "" {
 			exp = test.out
 		}
 
-		testutil.Equals(t, expr.String(), exp)
+		require.Equal(t, exp, expr.String())
 	}
 }

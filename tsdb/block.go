@@ -26,6 +26,7 @@ import (
 	"github.com/go-kit/kit/log/level"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
+
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
@@ -44,10 +45,9 @@ type IndexWriter interface {
 
 	// AddSeries populates the index writer with a series and its offsets
 	// of chunks that the index can reference.
-	// Implementations may require series to be insert in increasing order by
-	// their labels.
-	// The reference numbers are used to resolve entries in postings lists that
-	// are added later.
+	// Implementations may require series to be insert in strictly increasing order by
+	// their labels. The reference numbers are used to resolve entries in postings lists
+	// that are added later.
 	AddSeries(ref uint64, l labels.Labels, chunks ...chunks.Meta) error
 
 	// Close writes any finalization and closes the resources associated with
@@ -62,7 +62,10 @@ type IndexReader interface {
 	// beyond the lifetime of the index reader.
 	Symbols() index.StringIter
 
-	// LabelValues returns sorted possible label values.
+	// SortedLabelValues returns sorted possible label values.
+	SortedLabelValues(name string) ([]string, error)
+
+	// LabelValues returns possible label values which may not be sorted.
 	LabelValues(name string) ([]string, error)
 
 	// Postings returns the postings list iterator for the label pairs.
@@ -122,6 +125,9 @@ type BlockReader interface {
 
 	// Meta provides meta information about the block reader.
 	Meta() BlockMeta
+
+	// Size returns the number of bytes that the block takes up on disk.
+	Size() int64
 }
 
 // BlockMeta provides meta information about a block.
@@ -167,7 +173,7 @@ type BlockMetaCompaction struct {
 	// ULIDs of all source head blocks that went into the block.
 	Sources []ulid.ULID `json:"sources,omitempty"`
 	// Indicates that during compaction it resulted in a block without any samples
-	// so it should be deleted on the next reload.
+	// so it should be deleted on the next reloadBlocks.
 	Deletable bool `json:"deletable,omitempty"`
 	// Short descriptions of the direct blocks that were used to create
 	// this block.
@@ -220,19 +226,14 @@ func writeMetaFile(logger log.Logger, dir string, meta *BlockMeta) (int64, error
 		return 0, err
 	}
 
-	var merr tsdb_errors.MultiError
 	n, err := f.Write(jsonMeta)
 	if err != nil {
-		merr.Add(err)
-		merr.Add(f.Close())
-		return 0, merr.Err()
+		return 0, tsdb_errors.NewMulti(err, f.Close()).Err()
 	}
 
 	// Force the kernel to persist the file on disk to avoid data loss if the host crashes.
 	if err := f.Sync(); err != nil {
-		merr.Add(err)
-		merr.Add(f.Close())
-		return 0, merr.Err()
+		return 0, tsdb_errors.NewMulti(err, f.Close()).Err()
 	}
 	if err := f.Close(); err != nil {
 		return 0, err
@@ -274,10 +275,7 @@ func OpenBlock(logger log.Logger, dir string, pool chunkenc.Pool) (pb *Block, er
 	var closers []io.Closer
 	defer func() {
 		if err != nil {
-			var merr tsdb_errors.MultiError
-			merr.Add(err)
-			merr.Add(closeAll(closers))
-			err = merr.Err()
+			err = tsdb_errors.NewMulti(err, tsdb_errors.CloseAll(closers)).Err()
 		}
 	}()
 	meta, sizeMeta, err := readMetaFile(dir)
@@ -327,13 +325,11 @@ func (pb *Block) Close() error {
 
 	pb.pendingReaders.Wait()
 
-	var merr tsdb_errors.MultiError
-
-	merr.Add(pb.chunkr.Close())
-	merr.Add(pb.indexr.Close())
-	merr.Add(pb.tombstones.Close())
-
-	return merr.Err()
+	return tsdb_errors.NewMulti(
+		pb.chunkr.Close(),
+		pb.indexr.Close(),
+		pb.tombstones.Close(),
+	).Err()
 }
 
 func (pb *Block) String() string {
@@ -417,6 +413,11 @@ type blockIndexReader struct {
 
 func (r blockIndexReader) Symbols() index.StringIter {
 	return r.ir.Symbols()
+}
+
+func (r blockIndexReader) SortedLabelValues(name string) ([]string, error) {
+	st, err := r.ir.SortedLabelValues(name)
+	return st, errors.Wrapf(err, "block: %s", r.b.Meta().ULID)
 }
 
 func (r blockIndexReader) LabelValues(name string) ([]string, error) {

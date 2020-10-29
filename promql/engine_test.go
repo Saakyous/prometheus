@@ -19,23 +19,28 @@ import (
 	"io/ioutil"
 	"os"
 	"sort"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/go-kit/kit/log"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/goleak"
 
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
-	"github.com/prometheus/prometheus/util/testutil"
 )
+
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 func TestQueryConcurrency(t *testing.T) {
 	maxConcurrency := 10
 
 	dir, err := ioutil.TempDir("", "test_concurrency")
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 	defer os.RemoveAll(dir)
 	queryTracker := NewActiveQueryTracker(dir, maxConcurrency, nil)
 
@@ -114,12 +119,10 @@ func TestQueryTimeout(t *testing.T) {
 	})
 
 	res := query.Exec(ctx)
-	testutil.NotOk(t, res.Err, "expected timeout error but got none")
+	require.Error(t, res.Err, "expected timeout error but got none")
 
 	var e ErrQueryTimeout
-	// TODO: when circleci-windows moves to go 1.13:
-	// testutil.Assert(t, errors.As(res.Err, &e), "expected timeout error but got: %s", res.Err)
-	testutil.Assert(t, strings.HasPrefix(res.Err.Error(), e.Error()), "expected timeout error but got: %s", res.Err)
+	require.True(t, errors.As(res.Err, &e), "expected timeout error but got: %s", res.Err)
 }
 
 const errQueryCanceled = ErrQueryCanceled("test statement execution")
@@ -157,8 +160,8 @@ func TestQueryCancel(t *testing.T) {
 	block <- struct{}{}
 	<-processing
 
-	testutil.NotOk(t, res.Err, "expected cancellation error for query1 but got none")
-	testutil.Equals(t, errQueryCanceled, res.Err)
+	require.Error(t, res.Err, "expected cancellation error for query1 but got none")
+	require.Equal(t, errQueryCanceled, res.Err)
 
 	// Canceling a query before starting it must have no effect.
 	query2 := engine.newTestQuery(func(ctx context.Context) error {
@@ -167,7 +170,7 @@ func TestQueryCancel(t *testing.T) {
 
 	query2.Cancel()
 	res = query2.Exec(ctx)
-	testutil.Ok(t, res.Err)
+	require.NoError(t, res.Err)
 }
 
 // errQuerier implements storage.Querier which always returns error.
@@ -175,8 +178,8 @@ type errQuerier struct {
 	err error
 }
 
-func (q *errQuerier) Select(bool, *storage.SelectHints, ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
-	return errSeriesSet{err: q.err}, nil, q.err
+func (q *errQuerier) Select(bool, *storage.SelectHints, ...*labels.Matcher) storage.SeriesSet {
+	return errSeriesSet{err: q.err}
 }
 func (*errQuerier) LabelValues(string) ([]string, storage.Warnings, error) { return nil, nil, nil }
 func (*errQuerier) LabelNames() ([]string, storage.Warnings, error)        { return nil, nil, nil }
@@ -187,9 +190,10 @@ type errSeriesSet struct {
 	err error
 }
 
-func (errSeriesSet) Next() bool         { return false }
-func (errSeriesSet) At() storage.Series { return nil }
-func (e errSeriesSet) Err() error       { return e.err }
+func (errSeriesSet) Next() bool                   { return false }
+func (errSeriesSet) At() storage.Series           { return nil }
+func (e errSeriesSet) Err() error                 { return e.err }
+func (e errSeriesSet) Warnings() storage.Warnings { return nil }
 
 func TestQueryError(t *testing.T) {
 	opts := EngineOpts{
@@ -207,50 +211,40 @@ func TestQueryError(t *testing.T) {
 	defer cancelCtx()
 
 	vectorQuery, err := engine.NewInstantQuery(queryable, "foo", time.Unix(1, 0))
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	res := vectorQuery.Exec(ctx)
-	testutil.NotOk(t, res.Err, "expected error on failed select but got none")
-	testutil.Equals(t, errStorage, res.Err)
+	require.Error(t, res.Err, "expected error on failed select but got none")
+	require.True(t, errors.Is(res.Err, errStorage), "expected error doesn't match")
 
 	matrixQuery, err := engine.NewInstantQuery(queryable, "foo[1m]", time.Unix(1, 0))
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	res = matrixQuery.Exec(ctx)
-	testutil.NotOk(t, res.Err, "expected error on failed select but got none")
-	testutil.Equals(t, errStorage, res.Err)
+	require.Error(t, res.Err, "expected error on failed select but got none")
+	require.True(t, errors.Is(res.Err, errStorage), "expected error doesn't match")
 }
 
-// hintCheckerQuerier implements storage.Querier which checks the start and end times
-// in hints.
-type hintCheckerQuerier struct {
-	start    int64
-	end      int64
-	grouping []string
-	by       bool
-	selRange int64
-	function string
-
-	t *testing.T
+type noopHintRecordingQueryable struct {
+	hints []*storage.SelectHints
 }
 
-func (q *hintCheckerQuerier) Select(_ bool, sp *storage.SelectHints, _ ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
-	testutil.Equals(q.t, q.start, sp.Start)
-	testutil.Equals(q.t, q.end, sp.End)
-	testutil.Equals(q.t, q.grouping, sp.Grouping)
-	testutil.Equals(q.t, q.by, sp.By)
-	testutil.Equals(q.t, q.selRange, sp.Range)
-	testutil.Equals(q.t, q.function, sp.Func)
-
-	return errSeriesSet{err: nil}, nil, nil
+func (h *noopHintRecordingQueryable) Querier(context.Context, int64, int64) (storage.Querier, error) {
+	return &hintRecordingQuerier{Querier: &errQuerier{}, h: h}, nil
 }
-func (*hintCheckerQuerier) LabelValues(string) ([]string, storage.Warnings, error) {
-	return nil, nil, nil
-}
-func (*hintCheckerQuerier) LabelNames() ([]string, storage.Warnings, error) { return nil, nil, nil }
-func (*hintCheckerQuerier) Close() error                                    { return nil }
 
-func TestParamsSetCorrectly(t *testing.T) {
+type hintRecordingQuerier struct {
+	storage.Querier
+
+	h *noopHintRecordingQueryable
+}
+
+func (h *hintRecordingQuerier) Select(sortSeries bool, hints *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+	h.h.hints = append(h.h.hints, hints)
+	return h.Querier.Select(sortSeries, hints, matchers...)
+}
+
+func TestSelectHintsSetCorrectly(t *testing.T) {
 	opts := EngineOpts{
 		Logger:        nil,
 		Reg:           nil,
@@ -259,192 +253,139 @@ func TestParamsSetCorrectly(t *testing.T) {
 		LookbackDelta: 5 * time.Second,
 	}
 
-	cases := []struct {
+	for _, tc := range []struct {
 		query string
 
-		// All times are in seconds.
+		// All times are in milliseconds.
 		start int64
 		end   int64
 
-		paramStart int64
-		paramEnd   int64
-
-		paramGrouping []string
-		paramBy       bool
-		paramRange    int64
-		paramFunc     string
+		// TODO(bwplotka): Add support for better hints when subquerying.
+		expected []*storage.SelectHints
 	}{{
-		query: "foo",
-		start: 10,
-
-		paramStart: 5,
-		paramEnd:   10,
+		query: "foo", start: 10000,
+		expected: []*storage.SelectHints{
+			{Start: 5000, End: 10000},
+		},
 	}, {
-		query: "foo[2m]",
-		start: 200,
-
-		paramStart: 80, // 200 - 120
-		paramEnd:   200,
-		paramRange: 120000,
+		query: "foo[2m]", start: 200000,
+		expected: []*storage.SelectHints{
+			{Start: 80000, End: 200000, Range: 120000},
+		},
 	}, {
-		query: "foo[2m] offset 2m",
-		start: 300,
-
-		paramStart: 60,
-		paramEnd:   180,
-		paramRange: 120000,
+		query: "foo[2m] offset 2m", start: 300000,
+		expected: []*storage.SelectHints{
+			{Start: 60000, End: 180000, Range: 120000},
+		},
 	}, {
-		query: "foo[2m:1s]",
-		start: 300,
-
-		paramStart: 175, // 300 - 120 - 5
-		paramEnd:   300,
+		query: "foo[2m:1s]", start: 300000,
+		expected: []*storage.SelectHints{
+			{Start: 175000, End: 300000},
+		},
 	}, {
-		query: "count_over_time(foo[2m:1s])",
-		start: 300,
-
-		paramStart: 175, // 300 - 120 - 5
-		paramEnd:   300,
-		paramFunc:  "count_over_time",
+		query: "count_over_time(foo[2m:1s])", start: 300000,
+		expected: []*storage.SelectHints{
+			{Start: 175000, End: 300000, Func: "count_over_time"},
+		},
 	}, {
-		query: "count_over_time(foo[2m:1s] offset 10s)",
-		start: 300,
-
-		paramStart: 165, // 300 - 120 - 5 - 10
-		paramEnd:   300,
-		paramFunc:  "count_over_time",
+		query: "count_over_time(foo[2m:1s] offset 10s)", start: 300000,
+		expected: []*storage.SelectHints{
+			{Start: 165000, End: 290000, Func: "count_over_time"},
+		},
 	}, {
-		query: "count_over_time((foo offset 10s)[2m:1s] offset 10s)",
-		start: 300,
-
-		paramStart: 155, // 300 - 120 - 5 - 10 - 10
-		paramEnd:   290,
-		paramFunc:  "count_over_time",
+		query: "count_over_time((foo offset 10s)[2m:1s] offset 10s)", start: 300000,
+		expected: []*storage.SelectHints{
+			{Start: 155000, End: 280000, Func: "count_over_time"},
+		},
 	}, {
-		// Range queries now.
-		query: "foo",
-		start: 10,
-		end:   20,
 
-		paramStart: 5,
-		paramEnd:   20,
+		query: "foo", start: 10000, end: 20000,
+		expected: []*storage.SelectHints{
+			{Start: 5000, End: 20000, Step: 1000},
+		},
 	}, {
-		query: "rate(foo[2m])",
-		start: 200,
-		end:   500,
-
-		paramStart: 80, // 200 - 120
-		paramEnd:   500,
-		paramRange: 120000,
-		paramFunc:  "rate",
+		query: "rate(foo[2m])", start: 200000, end: 500000,
+		expected: []*storage.SelectHints{
+			{Start: 80000, End: 500000, Range: 120000, Func: "rate", Step: 1000},
+		},
 	}, {
-		query: "rate(foo[2m] offset 2m)",
-		start: 300,
-		end:   500,
-
-		paramStart: 60,
-		paramEnd:   380,
-		paramRange: 120000,
-		paramFunc:  "rate",
+		query: "rate(foo[2m] offset 2m)", start: 300000, end: 500000,
+		expected: []*storage.SelectHints{
+			{Start: 60000, End: 380000, Range: 120000, Func: "rate", Step: 1000},
+		},
 	}, {
-		query: "rate(foo[2m:1s])",
-		start: 300,
-		end:   500,
-
-		paramStart: 175, // 300 - 120 - 5
-		paramEnd:   500,
-		paramFunc:  "rate",
+		query: "rate(foo[2m:1s])", start: 300000, end: 500000,
+		expected: []*storage.SelectHints{
+			{Start: 175000, End: 500000, Func: "rate", Step: 1000},
+		},
 	}, {
-		query: "count_over_time(foo[2m:1s])",
-		start: 300,
-		end:   500,
-
-		paramStart: 175, // 300 - 120 - 5
-		paramEnd:   500,
-		paramFunc:  "count_over_time",
+		query: "count_over_time(foo[2m:1s])", start: 300000, end: 500000,
+		expected: []*storage.SelectHints{
+			{Start: 175000, End: 500000, Func: "count_over_time", Step: 1000},
+		},
 	}, {
-		query: "count_over_time(foo[2m:1s] offset 10s)",
-		start: 300,
-		end:   500,
-
-		paramStart: 165, // 300 - 120 - 5 - 10
-		paramEnd:   500,
-		paramFunc:  "count_over_time",
+		query: "count_over_time(foo[2m:1s] offset 10s)", start: 300000, end: 500000,
+		expected: []*storage.SelectHints{
+			{Start: 165000, End: 490000, Func: "count_over_time", Step: 1000},
+		},
 	}, {
-		query: "count_over_time((foo offset 10s)[2m:1s] offset 10s)",
-		start: 300,
-		end:   500,
-
-		paramStart: 155, // 300 - 120 - 5 - 10 - 10
-		paramEnd:   490,
-		paramFunc:  "count_over_time",
+		query: "count_over_time((foo offset 10s)[2m:1s] offset 10s)", start: 300000, end: 500000,
+		expected: []*storage.SelectHints{
+			{Start: 155000, End: 480000, Func: "count_over_time", Step: 1000},
+		},
 	}, {
-		query: "sum by (dim1) (foo)",
-		start: 10,
-
-		paramStart:    5,
-		paramEnd:      10,
-		paramGrouping: []string{"dim1"},
-		paramBy:       true,
-		paramFunc:     "sum",
+		query: "sum by (dim1) (foo)", start: 10000,
+		expected: []*storage.SelectHints{
+			{Start: 5000, End: 10000, Func: "sum", By: true, Grouping: []string{"dim1"}},
+		},
 	}, {
-		query: "sum without (dim1) (foo)",
-		start: 10,
-
-		paramStart:    5,
-		paramEnd:      10,
-		paramGrouping: []string{"dim1"},
-		paramBy:       false,
-		paramFunc:     "sum",
+		query: "sum without (dim1) (foo)", start: 10000,
+		expected: []*storage.SelectHints{
+			{Start: 5000, End: 10000, Func: "sum", Grouping: []string{"dim1"}},
+		},
 	}, {
-		query: "sum by (dim1) (avg_over_time(foo[1s]))",
-		start: 10,
-
-		paramStart:    9,
-		paramEnd:      10,
-		paramGrouping: nil,
-		paramBy:       false,
-		paramRange:    1000,
-		paramFunc:     "avg_over_time",
+		query: "sum by (dim1) (avg_over_time(foo[1s]))", start: 10000,
+		expected: []*storage.SelectHints{
+			{Start: 9000, End: 10000, Func: "avg_over_time", Range: 1000},
+		},
 	}, {
-		query: "sum by (dim1) (max by (dim2) (foo))",
-		start: 10,
-
-		paramStart:    5,
-		paramEnd:      10,
-		paramGrouping: []string{"dim2"},
-		paramBy:       true,
-		paramFunc:     "max",
+		query: "sum by (dim1) (max by (dim2) (foo))", start: 10000,
+		expected: []*storage.SelectHints{
+			{Start: 5000, End: 10000, Func: "max", By: true, Grouping: []string{"dim2"}},
+		},
 	}, {
-		query: "(max by (dim1) (foo))[5s:1s]",
-		start: 10,
+		query: "(max by (dim1) (foo))[5s:1s]", start: 10000,
+		expected: []*storage.SelectHints{
+			{Start: 0, End: 10000, Func: "max", By: true, Grouping: []string{"dim1"}},
+		},
+	}, {
+		query: "(sum(http_requests{group=~\"p.*\"})+max(http_requests{group=~\"c.*\"}))[20s:5s]", start: 120000,
+		expected: []*storage.SelectHints{
+			{Start: 95000, End: 120000, Func: "sum", By: true},
+			{Start: 95000, End: 120000, Func: "max", By: true},
+		},
+	}} {
+		t.Run(tc.query, func(t *testing.T) {
+			engine := NewEngine(opts)
+			hintsRecorder := &noopHintRecordingQueryable{}
 
-		paramStart:    0,
-		paramEnd:      10,
-		paramGrouping: []string{"dim1"},
-		paramBy:       true,
-		paramFunc:     "max",
-	}}
+			var (
+				query Query
+				err   error
+			)
+			if tc.end == 0 {
+				query, err = engine.NewInstantQuery(hintsRecorder, tc.query, timestamp.Time(tc.start))
+			} else {
+				query, err = engine.NewRangeQuery(hintsRecorder, tc.query, timestamp.Time(tc.start), timestamp.Time(tc.end), time.Second)
+			}
+			require.NoError(t, err)
 
-	for _, tc := range cases {
-		engine := NewEngine(opts)
-		queryable := storage.QueryableFunc(func(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
-			return &hintCheckerQuerier{start: tc.paramStart * 1000, end: tc.paramEnd * 1000, grouping: tc.paramGrouping, by: tc.paramBy, selRange: tc.paramRange, function: tc.paramFunc, t: t}, nil
+			res := query.Exec(context.Background())
+			require.NoError(t, res.Err)
+
+			require.Equal(t, tc.expected, hintsRecorder.hints)
 		})
 
-		var (
-			query Query
-			err   error
-		)
-		if tc.end == 0 {
-			query, err = engine.NewInstantQuery(queryable, tc.query, time.Unix(tc.start, 0))
-		} else {
-			query, err = engine.NewRangeQuery(queryable, tc.query, time.Unix(tc.start, 0), time.Unix(tc.end, 0), time.Second)
-		}
-		testutil.Ok(t, err)
-
-		res := query.Exec(context.Background())
-		testutil.Ok(t, res.Err)
 	}
 }
 
@@ -485,8 +426,8 @@ func TestEngineShutdown(t *testing.T) {
 	block <- struct{}{}
 	<-processing
 
-	testutil.NotOk(t, res.Err, "expected error on shutdown during query but got none")
-	testutil.Equals(t, errQueryCanceled, res.Err)
+	require.Error(t, res.Err, "expected error on shutdown during query but got none")
+	require.Equal(t, errQueryCanceled, res.Err)
 
 	query2 := engine.newTestQuery(func(context.Context) error {
 		t.Fatalf("reached query execution unexpectedly")
@@ -496,12 +437,10 @@ func TestEngineShutdown(t *testing.T) {
 	// The second query is started after the engine shut down. It must
 	// be canceled immediately.
 	res2 := query2.Exec(ctx)
-	testutil.NotOk(t, res2.Err, "expected error on querying with canceled context but got none")
+	require.Error(t, res2.Err, "expected error on querying with canceled context but got none")
 
 	var e ErrQueryCanceled
-	// TODO: when circleci-windows moves to go 1.13:
-	// testutil.Assert(t, errors.As(res2.Err, &e), "expected cancellation error but got: %s", res2.Err)
-	testutil.Assert(t, strings.HasPrefix(res2.Err.Error(), e.Error()), "expected cancellation error but got: %s", res2.Err)
+	require.True(t, errors.As(res2.Err, &e), "expected cancellation error but got: %s", res2.Err)
 }
 
 func TestEngineEvalStmtTimestamps(t *testing.T) {
@@ -509,11 +448,11 @@ func TestEngineEvalStmtTimestamps(t *testing.T) {
 load 10s
   metric 1 2
 `)
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 	defer test.Close()
 
 	err = test.Run()
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	cases := []struct {
 		Query       string
@@ -590,30 +529,31 @@ load 10s
 		} else {
 			qry, err = test.QueryEngine().NewRangeQuery(test.Queryable(), c.Query, c.Start, c.End, c.Interval)
 		}
-		testutil.Ok(t, err)
+		require.NoError(t, err)
 
 		res := qry.Exec(test.Context())
 		if c.ShouldError {
-			testutil.NotOk(t, res.Err, "expected error for the query %q", c.Query)
+			require.Error(t, res.Err, "expected error for the query %q", c.Query)
 			continue
 		}
 
-		testutil.Ok(t, res.Err)
-		testutil.Equals(t, c.Result, res.Value)
+		require.NoError(t, res.Err)
+		require.Equal(t, c.Result, res.Value, "query %q failed", c.Query)
 	}
-
 }
 
 func TestMaxQuerySamples(t *testing.T) {
 	test, err := NewTest(t, `
 load 10s
   metric 1 2
+  bigmetric{a="1"} 1 2
+  bigmetric{a="2"} 1 2
 `)
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 	defer test.Close()
 
 	err = test.Run()
-	testutil.Ok(t, err)
+	require.NoError(t, err)
 
 	cases := []struct {
 		Query      string
@@ -799,6 +739,18 @@ load 10s
 			End:      time.Unix(10, 0),
 			Interval: 5 * time.Second,
 		},
+		{
+			Query:      "rate(bigmetric[1s])",
+			MaxSamples: 1,
+			Result: Result{
+				nil,
+				Matrix{},
+				nil,
+			},
+			Start:    time.Unix(0, 0),
+			End:      time.Unix(10, 0),
+			Interval: 5 * time.Second,
+		},
 	}
 
 	engine := test.QueryEngine()
@@ -813,11 +765,11 @@ load 10s
 		} else {
 			qry, err = engine.NewRangeQuery(test.Queryable(), c.Query, c.Start, c.End, c.Interval)
 		}
-		testutil.Ok(t, err)
+		require.NoError(t, err)
 
 		res := qry.Exec(test.Context())
-		testutil.Equals(t, c.Result.Err, res.Err)
-		testutil.Equals(t, c.Result.Value, res.Value)
+		require.Equal(t, c.Result.Err, res.Err)
+		require.Equal(t, c.Result.Value, res.Value, "query %q failed", c.Query)
 	}
 }
 
@@ -825,7 +777,7 @@ func TestRecoverEvaluatorRuntime(t *testing.T) {
 	ev := &evaluator{logger: log.NewNopLogger()}
 
 	var err error
-	defer ev.recover(&err)
+	defer ev.recover(nil, &err)
 
 	// Cause a runtime panic.
 	var a []int
@@ -848,28 +800,50 @@ func TestRecoverEvaluatorError(t *testing.T) {
 			t.Fatalf("wrong error message: %q, expected %q", err, e)
 		}
 	}()
-	defer ev.recover(&err)
+	defer ev.recover(nil, &err)
+
+	panic(e)
+}
+
+func TestRecoverEvaluatorErrorWithWarnings(t *testing.T) {
+	ev := &evaluator{logger: log.NewNopLogger()}
+	var err error
+	var ws storage.Warnings
+
+	warnings := storage.Warnings{errors.New("custom warning")}
+	e := errWithWarnings{
+		err:      errors.New("custom error"),
+		warnings: warnings,
+	}
+
+	defer func() {
+		if err.Error() != e.Error() {
+			t.Fatalf("wrong error message: %q, expected %q", err, e)
+		}
+		if len(ws) != len(warnings) && ws[0] != warnings[0] {
+			t.Fatalf("wrong warning message: %q, expected %q", ws[0], warnings[0])
+		}
+	}()
+	defer ev.recover(&ws, &err)
 
 	panic(e)
 }
 
 func TestSubquerySelector(t *testing.T) {
-	tests := []struct {
+	type caseType struct {
+		Query  string
+		Result Result
+		Start  time.Time
+	}
+
+	for _, tst := range []struct {
 		loadString string
-		cases      []struct {
-			Query  string
-			Result Result
-			Start  time.Time
-		}
+		cases      []caseType
 	}{
 		{
 			loadString: `load 10s
 							metric 1 2`,
-			cases: []struct {
-				Query  string
-				Result Result
-				Start  time.Time
-			}{
+			cases: []caseType{
 				{
 					Query: "metric[20s:10s]",
 					Result: Result{
@@ -974,11 +948,7 @@ func TestSubquerySelector(t *testing.T) {
 							http_requests{job="api-server", instance="1", group="production"}	0+20x1000 200+30x1000
 							http_requests{job="api-server", instance="0", group="canary"}		0+30x1000 300+80x1000
 							http_requests{job="api-server", instance="1", group="canary"}		0+40x2000`,
-			cases: []struct {
-				Query  string
-				Result Result
-				Start  time.Time
-			}{
+			cases: []caseType{
 				{ // Normal selector.
 					Query: `http_requests{group=~"pro.*",instance="0"}[30s:10s]`,
 					Result: Result{
@@ -1079,32 +1049,27 @@ func TestSubquerySelector(t *testing.T) {
 				},
 			},
 		},
-	}
+	} {
+		t.Run("", func(t *testing.T) {
+			test, err := NewTest(t, tst.loadString)
+			require.NoError(t, err)
+			defer test.Close()
 
-	SetDefaultEvaluationInterval(1 * time.Minute)
-	for _, tst := range tests {
-		test, err := NewTest(t, tst.loadString)
-		testutil.Ok(t, err)
+			require.NoError(t, test.Run())
+			engine := test.QueryEngine()
+			for _, c := range tst.cases {
+				t.Run(c.Query, func(t *testing.T) {
+					qry, err := engine.NewInstantQuery(test.Queryable(), c.Query, c.Start)
+					require.NoError(t, err)
 
-		defer test.Close()
-
-		err = test.Run()
-		testutil.Ok(t, err)
-
-		engine := test.QueryEngine()
-		for _, c := range tst.cases {
-			var err error
-			var qry Query
-
-			qry, err = engine.NewInstantQuery(test.Queryable(), c.Query, c.Start)
-			testutil.Ok(t, err)
-
-			res := qry.Exec(test.Context())
-			testutil.Equals(t, c.Result.Err, res.Err)
-			mat := res.Value.(Matrix)
-			sort.Sort(mat)
-			testutil.Equals(t, c.Result.Value, mat)
-		}
+					res := qry.Exec(test.Context())
+					require.Equal(t, c.Result.Err, res.Err)
+					mat := res.Value.(Matrix)
+					sort.Sort(mat)
+					require.Equal(t, c.Result.Value, mat)
+				})
+			}
+		})
 	}
 }
 
@@ -1146,7 +1111,7 @@ func TestQueryLogger_basic(t *testing.T) {
 			return contextDone(ctx, "test statement execution")
 		})
 		res := query.Exec(ctx)
-		testutil.Ok(t, res.Err)
+		require.NoError(t, res.Err)
 	}
 
 	// Query works without query log initialized.
@@ -1156,28 +1121,28 @@ func TestQueryLogger_basic(t *testing.T) {
 	engine.SetQueryLogger(f1)
 	queryExec()
 	for i, field := range []interface{}{"params", map[string]interface{}{"query": "test statement"}} {
-		testutil.Equals(t, field, f1.logs[i])
+		require.Equal(t, field, f1.logs[i])
 	}
 
 	l := len(f1.logs)
 	queryExec()
-	testutil.Equals(t, 2*l, len(f1.logs))
+	require.Equal(t, 2*l, len(f1.logs))
 
 	// Test that we close the query logger when unsetting it.
-	testutil.Assert(t, !f1.closed, "expected f1 to be open, got closed")
+	require.False(t, f1.closed, "expected f1 to be open, got closed")
 	engine.SetQueryLogger(nil)
-	testutil.Assert(t, f1.closed, "expected f1 to be closed, got open")
+	require.True(t, f1.closed, "expected f1 to be closed, got open")
 	queryExec()
 
 	// Test that we close the query logger when swapping.
 	f2 := NewFakeQueryLogger()
 	f3 := NewFakeQueryLogger()
 	engine.SetQueryLogger(f2)
-	testutil.Assert(t, !f2.closed, "expected f2 to be open, got closed")
+	require.False(t, f2.closed, "expected f2 to be open, got closed")
 	queryExec()
 	engine.SetQueryLogger(f3)
-	testutil.Assert(t, f2.closed, "expected f2 to be closed, got open")
-	testutil.Assert(t, !f3.closed, "expected f3 to be open, got closed")
+	require.True(t, f2.closed, "expected f2 to be closed, got open")
+	require.False(t, f3.closed, "expected f3 to be open, got closed")
 	queryExec()
 }
 
@@ -1201,12 +1166,12 @@ func TestQueryLogger_fields(t *testing.T) {
 	})
 
 	res := query.Exec(ctx)
-	testutil.Ok(t, res.Err)
+	require.NoError(t, res.Err)
 
 	expected := []string{"foo", "bar"}
 	for i, field := range expected {
 		v := f1.logs[len(f1.logs)-len(expected)+i].(string)
-		testutil.Equals(t, field, v)
+		require.Equal(t, field, v)
 	}
 }
 
@@ -1231,9 +1196,9 @@ func TestQueryLogger_error(t *testing.T) {
 	})
 
 	res := query.Exec(ctx)
-	testutil.NotOk(t, res.Err, "query should have failed")
+	require.Error(t, res.Err, "query should have failed")
 
 	for i, field := range []interface{}{"params", map[string]interface{}{"query": "test statement"}, "error", testErr} {
-		testutil.Equals(t, f1.logs[i], field)
+		require.Equal(t, f1.logs[i], field)
 	}
 }

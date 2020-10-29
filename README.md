@@ -6,25 +6,25 @@
 [![Go Report Card](https://goreportcard.com/badge/github.com/prometheus/prometheus)](https://goreportcard.com/report/github.com/prometheus/prometheus)
 [![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/486/badge)](https://bestpractices.coreinfrastructure.org/projects/486)
 [![fuzzit](https://app.fuzzit.dev/badge?org_id=prometheus&branch=master)](https://fuzzit.dev)
+[![Gitpod ready-to-code](https://img.shields.io/badge/Gitpod-ready--to--code-blue?logo=gitpod)](https://gitpod.io/#https://github.com/prometheus/prometheus)
 
 Visit [prometheus.io](https://prometheus.io) for the full documentation,
 examples and guides.
 
 Prometheus, a [Cloud Native Computing Foundation](https://cncf.io/) project, is a systems and service monitoring system. It collects metrics
 from configured targets at given intervals, evaluates rule expressions,
-displays the results, and can trigger alerts if some condition is observed
-to be true.
+displays the results, and can trigger alerts when specified conditions are observed.
 
-Prometheus's main distinguishing features as compared to other monitoring systems are:
+The features that distinguish Prometheus from other metrics and monitoring systems are:
 
-- a **multi-dimensional** data model (timeseries defined by metric name and set of key/value dimensions)
-- a **flexible query language** to leverage this dimensionality
-- no dependency on distributed storage; **single server nodes are autonomous**
-- timeseries collection happens via a **pull model** over HTTP
-- **pushing timeseries** is supported via an intermediary gateway
-- targets are discovered via **service discovery** or **static configuration**
-- multiple modes of **graphing and dashboarding support**
-- support for hierarchical and horizontal **federation**
+- A **multi-dimensional** data model (time series defined by metric name and set of key/value dimensions)
+- PromQL, a **powerful and flexible query language** to leverage this dimensionality
+- No dependency on distributed storage; **single server nodes are autonomous**
+- An HTTP **pull model** for time series collection
+- **Pushing time series** is supported via an intermediary gateway for batch jobs
+- Targets are discovered via **service discovery** or **static configuration**
+- Multiple modes of **graphing and dashboarding support**
+- Support for hierarchical and horizontal **federation**
 
 ## Architecture overview
 
@@ -43,8 +43,6 @@ is the recommended way of installing Prometheus.
 See the [Installing](https://prometheus.io/docs/introduction/install/)
 chapter in the documentation for all the details.
 
-Debian packages [are available](https://packages.debian.org/sid/net/prometheus).
-
 ### Docker images
 
 Docker images are available on [Quay.io](https://quay.io/repository/prometheus/prometheus) or [Docker Hub](https://hub.docker.com/r/prom/prometheus/).
@@ -57,9 +55,9 @@ Prometheus will now be reachable at http://localhost:9090/.
 
 ### Building from source
 
-To build Prometheus from the source code yourself you need to have a working
+To build Prometheus from source code, first ensure that have a working
 Go environment with [version 1.13 or greater installed](https://golang.org/doc/install).
-You will also need to have [Node.js](https://nodejs.org/) and [Yarn](https://yarnpkg.com/)
+You also need [Node.js](https://nodejs.org/) and [Yarn](https://yarnpkg.com/)
 installed in order to build the frontend assets.
 
 You can directly use the `go` tool to download and install the `prometheus`
@@ -94,6 +92,7 @@ The Makefile provides several targets:
   * *format*: format the source code
   * *vet*: check the source code for common errors
   * *docker*: build a docker container for the current `HEAD`
+  * *assets*: build the new experimental React UI
 
 ## React UI Development
 
@@ -102,7 +101,7 @@ For more information on building, running, and developing on the new React-based
 ## More information
 
   * The source code is periodically indexed: [Prometheus Core](https://godoc.org/github.com/prometheus/prometheus).
-  * You will find a CircleCI configuration in `.circleci/config.yml`.
+  * You will find a CircleCI configuration in [`.circleci/config.yml`](.circleci/config.yml).
   * See the [Community page](https://prometheus.io/community) for how to reach the Prometheus developers and users on various communication channels.
 
 ## Contributing

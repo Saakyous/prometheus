@@ -18,8 +18,8 @@ import (
 	"github.com/golang/protobuf/jsonpb"
 	"github.com/golang/protobuf/proto"
 	pbdescriptor "github.com/golang/protobuf/protoc-gen-go/descriptor"
-	gogen "github.com/golang/protobuf/protoc-gen-go/generator"
 	structpb "github.com/golang/protobuf/ptypes/struct"
+	"github.com/grpc-ecosystem/grpc-gateway/internal/casing"
 	"github.com/grpc-ecosystem/grpc-gateway/protoc-gen-grpc-gateway/descriptor"
 	swagger_options "github.com/grpc-ecosystem/grpc-gateway/protoc-gen-swagger/options"
 )
@@ -64,8 +64,7 @@ var wktSchemas = map[string]schemaCore{
 		Format: "double",
 	},
 	".google.protobuf.BoolValue": schemaCore{
-		Type:   "boolean",
-		Format: "boolean",
+		Type: "boolean",
 	},
 	".google.protobuf.Empty": schemaCore{},
 	".google.protobuf.Struct": schemaCore{
@@ -109,9 +108,9 @@ func getEnumDefault(enum *descriptor.Enum) string {
 }
 
 // messageToQueryParameters converts a message to a list of swagger query parameters.
-func messageToQueryParameters(message *descriptor.Message, reg *descriptor.Registry, pathParams []descriptor.Parameter) (params []swaggerParameterObject, err error) {
+func messageToQueryParameters(message *descriptor.Message, reg *descriptor.Registry, pathParams []descriptor.Parameter, body *descriptor.Body) (params []swaggerParameterObject, err error) {
 	for _, field := range message.Fields {
-		p, err := queryParams(message, field, "", reg, pathParams)
+		p, err := queryParams(message, field, "", reg, pathParams, body)
 		if err != nil {
 			return nil, err
 		}
@@ -120,12 +119,33 @@ func messageToQueryParameters(message *descriptor.Message, reg *descriptor.Regis
 	return params, nil
 }
 
-// queryParams converts a field to a list of swagger query parameters recursively.
-func queryParams(message *descriptor.Message, field *descriptor.Field, prefix string, reg *descriptor.Registry, pathParams []descriptor.Parameter) (params []swaggerParameterObject, err error) {
+// queryParams converts a field to a list of swagger query parameters recursively through the use of nestedQueryParams.
+func queryParams(message *descriptor.Message, field *descriptor.Field, prefix string, reg *descriptor.Registry, pathParams []descriptor.Parameter, body *descriptor.Body) (params []swaggerParameterObject, err error) {
+	return nestedQueryParams(message, field, prefix, reg, pathParams, body, map[string]bool{})
+}
+
+// nestedQueryParams converts a field to a list of swagger query parameters recursively.
+// This function is a helper function for queryParams, that keeps track of cyclical message references
+//  through the use of
+//      touched map[string]bool
+// If a cycle is discovered, an error is returned, as cyclical data structures aren't allowed
+//  in query parameters.
+func nestedQueryParams(message *descriptor.Message, field *descriptor.Field, prefix string, reg *descriptor.Registry, pathParams []descriptor.Parameter, body *descriptor.Body, touchedIn map[string]bool) (params []swaggerParameterObject, err error) {
 	// make sure the parameter is not already listed as a path parameter
 	for _, pathParam := range pathParams {
 		if pathParam.Target == field {
 			return nil, nil
+		}
+	}
+	// make sure the parameter is not already listed as a body parameter
+	if body != nil {
+		if body.FieldPath == nil {
+			return nil, nil
+		}
+		for _, fieldPath := range body.FieldPath {
+			if fieldPath.Target == field {
+				return nil, nil
+			}
 		}
 	}
 	schema := schemaOfField(field, reg, nil)
@@ -216,6 +236,22 @@ func queryParams(message *descriptor.Message, field *descriptor.Field, prefix st
 	if err != nil {
 		return nil, fmt.Errorf("unknown message type %s", fieldType)
 	}
+
+	// Check for cyclical message reference:
+	isCycle := touchedIn[*msg.Name]
+	if isCycle {
+		return nil, fmt.Errorf("Recursive types are not allowed for query parameters, cycle found on %q", fieldType)
+	}
+
+	// Construct a new map with the message name so a cycle further down the recursive path can be detected.
+	// Do not keep anything in the original touched reference and do not pass that reference along.  This will
+	// prevent clobbering adjacent records while recursing.
+	touchedOut := make(map[string]bool)
+	for k, v := range touchedIn {
+		touchedOut[k] = v
+	}
+	touchedOut[*msg.Name] = true
+
 	for _, nestedField := range msg.Fields {
 		var fieldName string
 		if reg.GetUseJSONNamesForFields() {
@@ -223,7 +259,7 @@ func queryParams(message *descriptor.Message, field *descriptor.Field, prefix st
 		} else {
 			fieldName = field.GetName()
 		}
-		p, err := queryParams(msg, nestedField, prefix+fieldName+".", reg, pathParams)
+		p, err := nestedQueryParams(msg, nestedField, prefix+fieldName+".", reg, pathParams, body, touchedOut)
 		if err != nil {
 			return nil, err
 		}
@@ -468,7 +504,7 @@ func schemaOfField(f *descriptor.Field, reg *descriptor.Registry, refs refMap) s
 		}
 	}
 
-	if j, err := extractJSONSchemaFromFieldDescriptor(fd); err == nil {
+	if j, err := extractJSONSchemaFromFieldDescriptor(f.FieldDescriptorProto); err == nil {
 		updateSwaggerObjectFromJSONSchema(&ret, j, reg, f)
 	}
 
@@ -502,9 +538,10 @@ func primitiveSchema(t pbdescriptor.FieldDescriptorProto_Type) (ftype, format st
 		// Ditto.
 		return "integer", "int64", true
 	case pbdescriptor.FieldDescriptorProto_TYPE_BOOL:
-		return "boolean", "boolean", true
+		// NOTE: in swagger specification, format should be empty on boolean type
+		return "boolean", "", true
 	case pbdescriptor.FieldDescriptorProto_TYPE_STRING:
-		// NOTE: in swagger specifition, format should be empty on string type
+		// NOTE: in swagger specification, format should be empty on string type
 		return "string", "", true
 	case pbdescriptor.FieldDescriptorProto_TYPE_BYTES:
 		return "string", "byte", true
@@ -733,7 +770,13 @@ func isResourceName(prefix string) bool {
 
 func renderServices(services []*descriptor.Service, paths swaggerPathsObject, reg *descriptor.Registry, requestResponseRefs, customRefs refMap, msgs []*descriptor.Message) error {
 	// Correctness of svcIdx and methIdx depends on 'services' containing the services in the same order as the 'file.Service' array.
+	svcBaseIdx := 0
+	var lastFile *descriptor.File = nil
 	for svcIdx, svc := range services {
+		if svc.File != lastFile {
+			lastFile = svc.File
+			svcBaseIdx = svcIdx
+		}
 		for methIdx, meth := range svc.Methods {
 			for bIdx, b := range meth.Bindings {
 				// Iterate over all the swagger parameters
@@ -867,9 +910,15 @@ func renderServices(services []*descriptor.Service, paths swaggerPathsObject, re
 						Required:    true,
 						Schema:      &schema,
 					})
+					// add the parameters to the query string
+					queryParams, err := messageToQueryParameters(meth.RequestType, reg, b.PathParams, b.Body)
+					if err != nil {
+						return err
+					}
+					parameters = append(parameters, queryParams...)
 				} else if b.HTTPMethod == "GET" || b.HTTPMethod == "DELETE" {
 					// add the parameters to the query string
-					queryParams, err := messageToQueryParameters(meth.RequestType, reg, b.PathParams)
+					queryParams, err := messageToQueryParameters(meth.RequestType, reg, b.PathParams, b.Body)
 					if err != nil {
 						return err
 					}
@@ -968,7 +1017,7 @@ func renderServices(services []*descriptor.Service, paths swaggerPathsObject, re
 					if hasErrDef {
 						// https://github.com/OAI/OpenAPI-Specification/blob/3.0.0/versions/2.0.md#responses-object
 						operationObject.Responses["default"] = swaggerResponseObject{
-							Description: "An unexpected error response",
+							Description: "An unexpected error response.",
 							Schema: swaggerSchemaObject{
 								schemaCore: schemaCore{
 									Ref: fmt.Sprintf("#/definitions/%s", errDef),
@@ -993,7 +1042,7 @@ func renderServices(services []*descriptor.Service, paths swaggerPathsObject, re
 					}
 				}
 
-				methComments := protoComments(reg, svc.File, nil, "Service", int32(svcIdx), methProtoPath, int32(methIdx))
+				methComments := protoComments(reg, svc.File, nil, "Service", int32(svcIdx-svcBaseIdx), methProtoPath, int32(methIdx))
 				if err := updateSwaggerDataFromComments(reg, operationObject, meth, methComments, false); err != nil {
 					panic(err)
 				}
@@ -1654,7 +1703,7 @@ func isProtoPathMatches(paths []int32, outerPaths []int32, typeName string, type
 // For example, if we are trying to locate comments related to a field named
 // `Address` in a message named `Person`, the path will be:
 //
-//     [4, a, 2, b]
+//	 [4, a, 2, b]
 //
 // While `a` gets determined by the order in which the messages appear in
 // the proto file, and `b` is the field index specified in the proto
@@ -1828,6 +1877,9 @@ func swaggerSchemaFromProtoSchema(s *swagger_options.Schema, reg *descriptor.Reg
 	if s != nil && s.Example != nil {
 		ret.Example = json.RawMessage(s.Example.Value)
 	}
+	if s != nil && s.ExampleString != "" {
+		ret.Example = json.RawMessage(s.ExampleString)
+	}
 
 	return ret
 }
@@ -1871,13 +1923,14 @@ func protoJSONSchemaTypeToFormat(in []swagger_options.JSONSchema_JSONSchemaSimpl
 	case swagger_options.JSONSchema_ARRAY:
 		return "array", ""
 	case swagger_options.JSONSchema_BOOLEAN:
-		return "boolean", "boolean"
+		// NOTE: in swagger specification, format should be empty on boolean type
+		return "boolean", ""
 	case swagger_options.JSONSchema_INTEGER:
 		return "integer", "int32"
 	case swagger_options.JSONSchema_NUMBER:
 		return "number", "double"
 	case swagger_options.JSONSchema_STRING:
-		// NOTE: in swagger specifition, format should be empty on string type
+		// NOTE: in swagger specification, format should be empty on string type
 		return "string", ""
 	default:
 		// Maybe panic?
@@ -1969,7 +2022,7 @@ func lowerCamelCase(fieldName string, fields []*descriptor.Field, msgs []*descri
 }
 
 func doCamelCase(input string) string {
-	parameterString := gogen.CamelCase(input)
+	parameterString := casing.Camel(input)
 	builder := &strings.Builder{}
 	builder.WriteString(strings.ToLower(string(parameterString[0])))
 	builder.WriteString(parameterString[1:])
